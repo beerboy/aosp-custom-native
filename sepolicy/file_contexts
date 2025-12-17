@@ -1,0 +1,5 @@
+# SELinux file contexts for custom daemon
+#
+# Maps file paths to SELinux security contexts
+
+/system/bin/custom_daemon    u:object_r:custom_daemon_exec:s0

@@ -1,0 +1,36 @@
+// Custom Native Daemon for AOSP/AAOS
+//
+// This module builds a native C++ executable that runs as a system daemon.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_binary {
+    name: "custom_daemon",
+
+    // Source files
+    srcs: [
+        "custom_daemon.cpp",
+    ],
+
+    // Shared libraries
+    shared_libs: [
+        "libbase",      // Android base library (logging, etc.)
+        "liblog",       // Android logging
+    ],
+
+    // C++ standard
+    cppflags: [
+        "-std=c++17",
+        "-Wall",
+        "-Werror",
+    ],
+
+    // Install to system partition
+    proprietary: false,
+    vendor: false,
+
+    // Init script to start the daemon
+    init_rc: ["custom_daemon.rc"],
+}

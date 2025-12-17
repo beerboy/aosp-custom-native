@@ -1,0 +1,14 @@
+# Custom Daemon Init Script
+#
+# This script is processed by Android's init system during boot.
+# It defines how to start and manage the custom_daemon service.
+
+service custom_daemon /system/bin/custom_daemon
+    class main
+    user system
+    group system
+    disabled
+    oneshot
+
+on boot
+    start custom_daemon

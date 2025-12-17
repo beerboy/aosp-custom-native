@@ -1,0 +1,16 @@
+# SELinux Type Enforcement policy for custom_daemon
+#
+# This defines the security context and permissions for the custom daemon.
+
+type custom_daemon, domain;
+type custom_daemon_exec, exec_type, file_type, system_file_type;
+
+# Allow init to start custom_daemon
+init_daemon_domain(custom_daemon)
+
+# Allow basic operations
+allow custom_daemon self:capability { setuid setgid };
+
+# Allow logging to logcat
+allow custom_daemon logd:unix_stream_socket connectto;
+allow custom_daemon log_device:chr_file { open write };
