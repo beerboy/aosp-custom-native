@@ -1,0 +1,255 @@
+name: AOSP Build on GCE
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: 'Build target (default: emu_img_zip)'
+        required: false
+        default: 'emu_img_zip'
+      machine_type:
+        description: 'GCE machine type (default: n1-standard-8)'
+        required: false
+        default: 'n1-standard-8'
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_ZONE: us-central1-a
+  INSTANCE_NAME: aosp-builder-${{ github.run_number }}
+  BUCKET_NAME: ${{ secrets.GCP_PROJECT_ID }}-aosp-builds
+  AOSP_BRANCH: android-14.0.0_r75
+  LUNCH_TARGET: aosp_x86_64-trunk_staging-eng
+
+jobs:
+  build:
+    name: Build AOSP on GCE
+    runs-on: ubuntu-latest
+    timeout-minutes: 300  # 5 hours max
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Create GCE instance
+        id: create-instance
+        run: |
+          MACHINE_TYPE="${{ github.event.inputs.machine_type || 'n1-standard-8' }}"
+
+          echo "Creating GCE instance: ${INSTANCE_NAME}"
+          echo "Machine type: ${MACHINE_TYPE}"
+
+          gcloud compute instances create ${INSTANCE_NAME} \
+            --project=${GCP_PROJECT_ID} \
+            --zone=${GCP_ZONE} \
+            --machine-type=${MACHINE_TYPE} \
+            --boot-disk-size=250GB \
+            --boot-disk-type=pd-ssd \
+            --image-family=ubuntu-2404-lts-amd64 \
+            --image-project=ubuntu-os-cloud \
+            --scopes=https://www.googleapis.com/auth/cloud-platform \
+            --metadata=startup-script='#!/bin/bash
+              set -e
+
+              # Update and install dependencies
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y git-core gnupg flex bison build-essential \
+                zip curl zlib1g-dev libc6-dev-i386 x11proto-core-dev \
+                libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils \
+                xsltproc unzip fontconfig python3 python-is-python3
+
+              # Install repo tool
+              mkdir -p /opt/bin
+              curl https://storage.googleapis.com/git-repo-downloads/repo > /opt/bin/repo
+              chmod a+x /opt/bin/repo
+
+              # Create build user
+              useradd -m -s /bin/bash builder
+
+              echo "GCE instance startup complete"
+            '
+
+          echo "instance_name=${INSTANCE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Wait for instance to be ready
+        run: |
+          echo "Waiting for instance startup to complete..."
+          sleep 90
+
+          # Wait for SSH to be available
+          for i in {1..10}; do
+            if gcloud compute ssh ${INSTANCE_NAME} \
+              --zone=${GCP_ZONE} \
+              --command="echo 'SSH ready'" 2>/dev/null; then
+              echo "Instance is ready"
+              break
+            fi
+            echo "Attempt $i/10: waiting for SSH..."
+            sleep 10
+          done
+
+      - name: Sync AOSP source
+        run: |
+          echo "Starting AOSP source sync..."
+
+          gcloud compute ssh ${INSTANCE_NAME} \
+            --zone=${GCP_ZONE} \
+            --command='
+              set -e
+              export PATH=/opt/bin:$PATH
+
+              # Switch to builder user
+              sudo -u builder bash << "BUILDER_EOF"
+                set -e
+                cd /home/builder
+
+                # Configure git
+                git config --global user.name "AOSP CI"
+                git config --global user.email "ci@example.com"
+                git config --global color.ui false
+
+                # Create workspace
+                mkdir -p aosp
+                cd aosp
+
+                # Initialize repo
+                echo "Initializing repo..."
+                /opt/bin/repo init -u https://android.googlesource.com/platform/manifest \
+                  -b '"${AOSP_BRANCH}"' \
+                  --depth=1
+
+                # Add custom manifest
+                echo "Adding custom manifest..."
+                mkdir -p .repo/local_manifests
+                cat > .repo/local_manifests/custom.xml << "MANIFEST_EOF"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <remote name="github"
+                    fetch="https://github.com/beerboy"
+                    revision="main" />
+
+            <project path="vendor/custom/native-process"
+                     name="aosp-custom-native"
+                     remote="github"
+                     revision="main" />
+          </manifest>
+          MANIFEST_EOF
+
+                # Sync source
+                echo "Syncing AOSP source (this will take 30-60 minutes)..."
+                /opt/bin/repo sync -c -j$(nproc) --no-tags --no-clone-bundle
+
+                echo "AOSP sync complete"
+          BUILDER_EOF
+            '
+
+      - name: Build AOSP
+        run: |
+          BUILD_TARGET="${{ github.event.inputs.build_target || 'emu_img_zip' }}"
+
+          echo "Starting AOSP build..."
+          echo "Target: ${BUILD_TARGET}"
+          echo "Lunch: ${LUNCH_TARGET}"
+
+          gcloud compute ssh ${INSTANCE_NAME} \
+            --zone=${GCP_ZONE} \
+            --command='
+              set -e
+
+              sudo -u builder bash << "BUILDER_EOF"
+                set -e
+                cd /home/builder/aosp
+
+                # Source build environment
+                source build/envsetup.sh
+
+                # Set lunch target
+                lunch '"${LUNCH_TARGET}"'
+
+                # Build
+                echo "Building '"${BUILD_TARGET}"'..."
+                m '"${BUILD_TARGET}"' -j$(nproc)
+
+                echo "Build complete"
+          BUILDER_EOF
+            '
+
+      - name: Upload artifacts to GCS
+        run: |
+          echo "Uploading build artifacts to GCS..."
+
+          BUILD_TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+          gcloud compute ssh ${INSTANCE_NAME} \
+            --zone=${GCP_ZONE} \
+            --command="
+              set -e
+
+              sudo -u builder bash << 'BUILDER_EOF'
+                set -e
+                cd /home/builder/aosp
+
+                # Find the product output directory
+                PRODUCT_OUT=\$(find out/target/product -name 'emu_img_zip.zip' -type f | head -1)
+
+                if [ -z \"\${PRODUCT_OUT}\" ]; then
+                  echo 'Error: emu_img_zip.zip not found'
+                  exit 1
+                fi
+
+                echo \"Found build artifact: \${PRODUCT_OUT}\"
+
+                # Upload to GCS
+                gsutil cp \${PRODUCT_OUT} gs://${BUCKET_NAME}/builds/${BUILD_TIMESTAMP}/
+
+                # Update latest pointer
+                echo '${BUILD_TIMESTAMP}' > /tmp/latest.txt
+                gsutil cp /tmp/latest.txt gs://${BUCKET_NAME}/builds/latest.txt
+
+                echo 'Upload complete'
+          BUILDER_EOF
+            "
+
+          echo "Build artifacts uploaded"
+          echo "Build timestamp: ${BUILD_TIMESTAMP}"
+          echo ""
+          echo "Download with:"
+          echo "  export GCP_PROJECT_ID=${GCP_PROJECT_ID}"
+          echo "  /data/aosp_ws/scripts/ci/download-build.sh"
+
+      - name: Cleanup - Delete instance
+        if: always()
+        run: |
+          echo "Deleting GCE instance: ${INSTANCE_NAME}"
+
+          gcloud compute instances delete ${INSTANCE_NAME} \
+            --zone=${GCP_ZONE} \
+            --quiet || true
+
+          echo "Instance deleted"
+
+      - name: Build summary
+        if: success()
+        run: |
+          echo "========================================="
+          echo "  ✅ AOSP Build Successful!"
+          echo "========================================="
+          echo ""
+          echo "Artifacts are available in GCS:"
+          echo "  gs://${BUCKET_NAME}/builds/"
+          echo ""
+          echo "Next steps:"
+          echo "  1. Download build artifacts locally"
+          echo "  2. Start Android Emulator"
+          echo "  3. Verify custom daemon with adb logcat"
