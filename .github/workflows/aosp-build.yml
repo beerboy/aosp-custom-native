@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       build_target:
-        description: 'Build target (default: emu_img_zip)'
+        description: 'Build target (default: droid)'
         required: false
-        default: 'emu_img_zip'
+        default: 'droid'
       machine_type:
         description: 'GCE machine type (default: n1-standard-8)'
         required: false
@@ -21,7 +21,7 @@ env:
   INSTANCE_NAME: aosp-builder-${{ github.run_number }}
   BUCKET_NAME: ${{ secrets.GCP_PROJECT_ID }}-aosp-builds
   AOSP_BRANCH: android-14.0.0_r75
-  LUNCH_TARGET: aosp_x86_64-trunk_staging-eng
+  LUNCH_TARGET: aosp_cf_x86_64_phone-trunk_staging-eng
 
 jobs:
   build:
@@ -156,7 +156,7 @@ jobs:
 
       - name: Build AOSP
         run: |
-          BUILD_TARGET="${{ github.event.inputs.build_target || 'emu_img_zip' }}"
+          BUILD_TARGET="${{ github.event.inputs.build_target || 'droid' }}"
 
           echo "Starting AOSP build..."
           echo "Target: ${BUILD_TARGET}"
@@ -200,18 +200,35 @@ jobs:
                 set -e
                 cd /home/builder/aosp
 
-                # Find the product output directory
-                PRODUCT_OUT=\$(find out/target/product -name 'emu_img_zip.zip' -type f | head -1)
+                # Product output directory for Cuttlefish
+                PRODUCT_DIR=\"out/target/product/aosp_cf_x86_64_phone\"
 
-                if [ -z \"\${PRODUCT_OUT}\" ]; then
-                  echo 'Error: emu_img_zip.zip not found'
+                if [ ! -d \"\${PRODUCT_DIR}\" ]; then
+                  echo \"Error: Product directory not found: \${PRODUCT_DIR}\"
                   exit 1
                 fi
 
-                echo \"Found build artifact: \${PRODUCT_OUT}\"
+                echo \"Packaging build artifacts from: \${PRODUCT_DIR}\"
+
+                # Create tarball of essential emulator images
+                cd \${PRODUCT_DIR}
+                tar czf /tmp/aosp-images.tar.gz \
+                  *.img \
+                  kernel* \
+                  ramdisk* \
+                  --exclude='*.qcow2' \
+                  2>/dev/null || true
+
+                # Verify tarball was created
+                if [ ! -f /tmp/aosp-images.tar.gz ]; then
+                  echo \"Error: Failed to create tarball\"
+                  exit 1
+                fi
+
+                echo \"Tarball created: \$(du -h /tmp/aosp-images.tar.gz | cut -f1)\"
 
                 # Upload to GCS
-                gsutil cp \${PRODUCT_OUT} gs://${BUCKET_NAME}/builds/${BUILD_TIMESTAMP}/
+                gsutil cp /tmp/aosp-images.tar.gz gs://${BUCKET_NAME}/builds/${BUILD_TIMESTAMP}/
 
                 # Update latest pointer
                 echo '${BUILD_TIMESTAMP}' > /tmp/latest.txt
