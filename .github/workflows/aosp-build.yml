@@ -11,9 +11,9 @@ on:
         required: false
         default: 'droid'
       machine_type:
-        description: 'GCE machine type (default: n1-standard-8)'
+        description: 'GCE machine type (default: n1-standard-32)'
         required: false
-        default: 'n1-standard-8'
+        default: 'n1-standard-32'
 
 env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -27,7 +27,7 @@ jobs:
   build:
     name: Build AOSP on GCE
     runs-on: ubuntu-latest
-    timeout-minutes: 300  # 5 hours max
+    timeout-minutes: 360  # 6 hours max (GitHub Actions limit)
 
     steps:
       - name: Checkout code
@@ -44,7 +44,7 @@ jobs:
       - name: Create GCE instance
         id: create-instance
         run: |
-          MACHINE_TYPE="${{ github.event.inputs.machine_type || 'n1-standard-8' }}"
+          MACHINE_TYPE="${{ github.event.inputs.machine_type || 'n1-standard-32' }}"
 
           echo "Creating GCE instance: ${INSTANCE_NAME}"
           echo "Machine type: ${MACHINE_TYPE}"
