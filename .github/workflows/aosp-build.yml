@@ -19,6 +19,7 @@ env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   GCP_ZONE: us-central1-a
   INSTANCE_NAME: aosp-builder-${{ github.run_number }}
+  PERSISTENT_DISK_NAME: aosp-build-persistent-disk
   BUCKET_NAME: ${{ secrets.GCP_PROJECT_ID }}-aosp-builds
   AOSP_BRANCH: android-14.0.0_r75
   LUNCH_TARGET: aosp_cf_x86_64_phone-trunk_staging-eng
@@ -41,44 +42,69 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      - name: Create or attach persistent disk
+        id: create-disk
+        run: |
+          # Check if persistent disk exists
+          if gcloud compute disks describe ${PERSISTENT_DISK_NAME} \
+               --zone=${GCP_ZONE} --project=${GCP_PROJECT_ID} &> /dev/null; then
+            echo "disk_exists=true" >> $GITHUB_OUTPUT
+            echo "Existing disk found - will use for incremental build"
+          else
+            echo "disk_exists=false" >> $GITHUB_OUTPUT
+            echo "No disk found - will create new disk for initial build"
+          fi
+
       - name: Create GCE instance
         id: create-instance
         run: |
           MACHINE_TYPE="${{ github.event.inputs.machine_type || 'n1-standard-32' }}"
+          DISK_EXISTS="${{ steps.create-disk.outputs.disk_exists }}"
 
           echo "Creating GCE instance: ${INSTANCE_NAME}"
           echo "Machine type: ${MACHINE_TYPE}"
+          echo "Disk exists: ${DISK_EXISTS}"
 
-          gcloud compute instances create ${INSTANCE_NAME} \
-            --project=${GCP_PROJECT_ID} \
-            --zone=${GCP_ZONE} \
-            --machine-type=${MACHINE_TYPE} \
-            --boot-disk-size=250GB \
-            --boot-disk-type=pd-ssd \
-            --image-family=ubuntu-2404-lts-amd64 \
-            --image-project=ubuntu-os-cloud \
-            --scopes=https://www.googleapis.com/auth/cloud-platform \
-            --metadata=startup-script='#!/bin/bash
-              set -e
+          if [ "$DISK_EXISTS" = "true" ]; then
+            # Attach existing persistent disk as boot disk
+            echo "Attaching existing persistent disk..."
+            gcloud compute instances create ${INSTANCE_NAME} \
+              --project=${GCP_PROJECT_ID} \
+              --zone=${GCP_ZONE} \
+              --machine-type=${MACHINE_TYPE} \
+              --disk=name=${PERSISTENT_DISK_NAME},boot=yes,mode=rw \
+              --scopes=https://www.googleapis.com/auth/cloud-platform
+          else
+            # Create new instance with new persistent disk
+            echo "Creating new instance with new persistent disk..."
+            gcloud compute instances create ${INSTANCE_NAME} \
+              --project=${GCP_PROJECT_ID} \
+              --zone=${GCP_ZONE} \
+              --machine-type=${MACHINE_TYPE} \
+              --create-disk=name=${PERSISTENT_DISK_NAME},size=250GB,type=pd-ssd,boot=yes,image-family=ubuntu-2404-lts-amd64,image-project=ubuntu-os-cloud \
+              --scopes=https://www.googleapis.com/auth/cloud-platform \
+              --metadata=startup-script='#!/bin/bash
+                set -e
 
-              # Update and install dependencies
-              export DEBIAN_FRONTEND=noninteractive
-              apt-get update
-              apt-get install -y git-core gnupg flex bison build-essential \
-                zip curl zlib1g-dev libc6-dev-i386 x11proto-core-dev \
-                libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils \
-                xsltproc unzip fontconfig python3 python-is-python3
+                # Update and install dependencies
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update
+                apt-get install -y git-core gnupg flex bison build-essential \
+                  zip curl zlib1g-dev libc6-dev-i386 x11proto-core-dev \
+                  libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils \
+                  xsltproc unzip fontconfig python3 python-is-python3
 
-              # Install repo tool
-              mkdir -p /opt/bin
-              curl https://storage.googleapis.com/git-repo-downloads/repo > /opt/bin/repo
-              chmod a+x /opt/bin/repo
+                # Install repo tool
+                mkdir -p /opt/bin
+                curl https://storage.googleapis.com/git-repo-downloads/repo > /opt/bin/repo
+                chmod a+x /opt/bin/repo
 
-              # Create build user
-              useradd -m -s /bin/bash builder
+                # Create build user
+                useradd -m -s /bin/bash builder
 
-              echo "GCE instance startup complete"
-            '
+                echo "GCE instance startup complete"
+              '
+          fi
 
           echo "instance_name=${INSTANCE_NAME}" >> $GITHUB_OUTPUT
 
@@ -100,8 +126,9 @@ jobs:
           done
 
       - name: Sync AOSP source
+        if: steps.create-disk.outputs.disk_exists == 'false'
         run: |
-          echo "Starting AOSP source sync..."
+          echo "Starting AOSP source sync (initial build)..."
 
           gcloud compute ssh ${INSTANCE_NAME} \
             --zone=${GCP_ZONE} \
@@ -168,6 +195,36 @@ jobs:
                 done
 
                 echo "AOSP sync complete"
+          BUILDER_EOF
+            '
+
+      - name: Update AOSP source (incremental)
+        if: steps.create-disk.outputs.disk_exists == 'true'
+        run: |
+          echo "Updating AOSP source (incremental sync)..."
+
+          gcloud compute ssh ${INSTANCE_NAME} \
+            --zone=${GCP_ZONE} \
+            --command='
+              set -e
+              export PATH=/opt/bin:$PATH
+
+              sudo -u builder bash << "BUILDER_EOF"
+                set -e
+                cd /home/builder/aosp
+
+                # Update custom manifest in case it changed
+                echo "Checking for manifest updates..."
+                if [ -d .repo ]; then
+                  # Sync only changed files (much faster)
+                  echo "Running incremental repo sync..."
+                  /opt/bin/repo sync -c -j16 --no-tags --no-clone-bundle vendor/custom/native-process || true
+
+                  echo "Incremental sync complete"
+                else
+                  echo "ERROR: .repo directory not found in persistent disk"
+                  exit 1
+                fi
           BUILDER_EOF
             '
 
@@ -262,16 +319,19 @@ jobs:
           echo "  export GCP_PROJECT_ID=${GCP_PROJECT_ID}"
           echo "  /data/aosp_ws/scripts/ci/download-build.sh"
 
-      - name: Cleanup - Delete instance
+      - name: Cleanup - Delete instance but keep disk
         if: always()
         run: |
           echo "Deleting GCE instance: ${INSTANCE_NAME}"
+          echo "Persistent disk will be kept for next build"
 
+          # Delete instance but keep persistent disk attached
           gcloud compute instances delete ${INSTANCE_NAME} \
             --zone=${GCP_ZONE} \
+            --keep-disks=all \
             --quiet || true
 
-          echo "Instance deleted"
+          echo "Instance deleted (disk preserved)"
 
       - name: Build summary
         if: success()
