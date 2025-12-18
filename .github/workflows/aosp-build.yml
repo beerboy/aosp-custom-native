@@ -146,9 +146,26 @@ jobs:
           </manifest>
           MANIFEST_EOF
 
-                # Sync source
+                # Sync source with rate limit handling
                 echo "Syncing AOSP source (this will take 30-60 minutes)..."
-                /opt/bin/repo sync -c -j$(nproc) --no-tags --no-clone-bundle
+
+                # Use 16 parallel jobs to balance speed and rate limits
+                # Retry up to 3 times with exponential backoff
+                RETRY_COUNT=0
+                MAX_RETRIES=3
+
+                until /opt/bin/repo sync -c -j16 --no-tags --no-clone-bundle; do
+                  RETRY_COUNT=$((RETRY_COUNT + 1))
+                  if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
+                    echo "ERROR: repo sync failed after $MAX_RETRIES attempts"
+                    exit 1
+                  fi
+
+                  WAIT_TIME=$((RETRY_COUNT * 60))
+                  echo "repo sync failed (attempt $RETRY_COUNT/$MAX_RETRIES)"
+                  echo "Waiting $WAIT_TIME seconds before retry..."
+                  sleep $WAIT_TIME
+                done
 
                 echo "AOSP sync complete"
           BUILDER_EOF
