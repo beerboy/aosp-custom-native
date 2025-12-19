@@ -162,6 +162,9 @@ jobs:
                 cat > .repo/local_manifests/custom.xml << "MANIFEST_EOF"
           <?xml version="1.0" encoding="UTF-8"?>
           <manifest>
+            <!-- Remove OpenWRT prebuilts (requires loop device access) -->
+            <remove-project name="platform/external/openwrt-prebuilts" />
+
             <remote name="github"
                     fetch="https://github.com/beerboy"
                     revision="main" />
